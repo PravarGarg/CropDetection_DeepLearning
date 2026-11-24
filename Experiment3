@@ -1,0 +1,123 @@
+# Experiment 3 (v3): Leak-Free Hyperspectral Band Selection & ViT-Graph Classification
+
+A rigorous experimental benchmark for **Hyperspectral Image (HSI) Band Selection** and **Hybrid Vision Transformer + Superpixel Graph Classification** on the **Salinas** dataset (`512 × 217` pixels, `204` spectral bands, `54,129` labeled pixels across `16` agricultural classes).
+
+This repository eliminates the **spatial and label leakage** present in standard random pixel splits (`v2`, where every method reached `~99.95%` OA) and evaluates whether differentiable band selection (`ConcreteSelector`) can match or outperform full-spectrum models under strict spatial disjointness (`SPLIT = "group"`).
+
+---
+
+## 1. The Problem
+
+Hyperspectral sensors capture hundreds of contiguous narrowband channels that enable fine-grained material discrimination, but introduce **severe spectral redundancy**, higher storage/compute costs, and **overfitting** when labeled spatial regions are limited.
+
+More critically, standard HSI classification benchmarks suffer from two forms of evaluation leakage:
+
+1. **Patch Overlap & Superpixel Leakage:** Random pixel-level train/test splits place training and test pixels inside the same homogeneous crop fields. Extracting `7 × 7` spatial patches and building superpixel graphs causes training and test windows to overlap and share labeled graph nodes—artificially inflating Overall Accuracy (OA) to **~99.95%**.
+2. **Misleading Band Ranking:** Under leaky splits, correlated adjacent bands appear interchangeable because nearby pixels share nearly identical spectra. Under true spatial separation, naive univariate filters (such as ANOVA F-tests) collapse onto clusters of adjacent, redundant bands and fail to generalize.
+
+---
+
+## 2. How We Solved It: Leak-Free Evaluation Protocol
+
+To measure genuine out-of-region generalization, `v3` enforces a strict four-stage leak-free pipeline:
+
+| Stage | Implementation (`SPLIT = "group"`, `GRAPH_SEG = "fixed"`) | Purpose |
+| :--- | :--- | :--- |
+| **1. Label-Free Superpixel Partitioning** | SLIC (`N_SEGMENTS = 200`, `COMPACTNESS = 0.1`) segments the first 3 standardized PCs of the scene into **`170` reference superpixels** shared across all methods. | Keeps region geometry fixed and label-free so accuracy differences reflect only the chosen bands. |
+| **2. Class-Balanced Disjoint Split** | Whole superpixels are greedily assigned to test (`SPLIT_SEED = 42`), yielding **`20,414` test pixels (`37.7%`)** while guaranteeing every one of the `16` classes retains **$\ge 40\%$** of its pixels for training. | Prevents test pixels from sharing superpixel graph nodes with training labels without starving minority classes. |
+| **3. Exact Patch-Radius Buffer** | A `13 × 13` morphological dilation (`2 × (PATCH - 1) + 1` for `PATCH = 7`) around test pixels removes **`12,775` boundary training pixels**, leaving **`20,940` training pixels**. | Guarantees **zero pixel overlap** even at the corners of training and test `7 × 7` windows. |
+| **4. Train-Only Fitting & Noise Check** | `StandardScaler`, `PCA`, `f_classif`, and `ConcreteSelector` are fit exclusively on post-buffer `train_idx`. A 6-run sanity check (`MODE = "check"`) verified realistic variance (`88.21% ± 0.57%` PCA, `87.13% ± 1.14%` uniform at `k=10`) before launching the 60-run grid. | Eliminates statistical and feature-selection leakage from test pixels. |
+
+---
+
+## 3. Methodology
+
+### Band Selection & Dimensionality Reduction Methods
+We evaluate four selection/compression methods across band budgets $k \in \{5, 10, 20, 40\}$, alongside a **30-component PCA reference (`PCA k=30`)** and the **full 204-band baseline (`all bands`)**:
+
+* **Concrete Band Selector (`learned`):** End-to-end differentiable Gumbel-Softmax selector (`SelectorNet`, annealed $\tau: 10.0 \rightarrow 0.1$ over `50` epochs) with uniqueness regularization ($\lambda = 0.1$) and `N_RESTARTS = 3` scored via a 15-epoch pixel-MLP proxy on held-out training pixels. Inference uses confidence-ordered greedy discretization (`resolve_selection`) enforcing `MIN_GAP = 3` channels between selected bands.
+* **Principal Component Analysis (`pca`):** Orthogonal linear projection onto the top-$k$ principal components (requires measuring all `204` bands; serves as a dense feature-compression reference).
+* **ANOVA F-Test (`anova`):** Supervised univariate ranking (`f_classif`) selecting the top-$k$ individual bands by class separability.
+* **Uniform Spacing (`uniform`):** Deterministic equidistant sampling across indices `0..203`.
+* **Random Subsets (`random`):** Stochastic baseline (`3` independent band draws $\times$ `2` seeds = `6` runs per $k$).
+* **All Bands (`all bands`):** Uncompressed `204`-channel full-spectrum baseline.
+
+### Downstream Hybrid ViT + Superpixel Graph Architecture
+Every band subset or projection ($k$ channels) is evaluated with the same dual-branch network trained for `10` epochs (`SEEDS = [42, 43]`, Adam with `200`-step linear warm-up + cosine decay, inverse-frequency class weights):
+
+1. **Local Patch ViT Branch:** Extracts reflection-padded `7 × 7 × k` patches, embeds them via `Conv2d(k, 128, kernel_size=3, padding=1)` + learnable positional embeddings (`49` tokens), and encodes spatial-spectral interactions through a **2-layer Transformer Encoder** (`4` heads, `dim = 128`).
+2. **Global Superpixel Graph Branch:** Builds a symmetric `kNN` graph (`KNN_K = 5`) over the `170` superpixel mean feature vectors and applies **2 GCN layers** (`k → 64 → 64`) followed by a **Graph Transformer** (`4` heads, `dim = 64`). Because test superpixels carry zero labels, message passing provides transductive scene context without label leakage.
+3. **Fusion Classifier:** Concatenates local ViT (`128`) and region Graph (`64`) embeddings into a `128`-unit MLP (`Dropout = 0.3`) predicting the `16` classes.
+
+---
+
+## 4. Results & Visual Analysis
+
+### 4.1 Quantitative Benchmark Results (`MODE = "full"`, 60 Runs)
+
+<!-- ================= PASTE SCREENSHOT 1: CELL 8 RESULTS TABLE HERE ================= -->
+![Benchmark Results Table](assets/results_table.png)
+
+* **Eliminating Leakage Restores Realistic Accuracy:** Moving from random pixel splits (`~99.95%` OA) to buffer-isolated superpixel splits brings test OA into the **`81.29%–91.59%`** range while `train acc` stays at `99.84%–100.00%`, confirming genuine spatial evaluation without underfitting.
+* **Learned Selection Wins at Tight Band Budgets (`k = 5`):** Using less than **2.5% of the spectrum** (`5` of `204` bands), `ConcreteSelector` achieves **`88.91% ± 1.83%` OA** (`87.79%` Kappa), outperforming `all bands` (`86.27% ± 1.32%`) by **+2.64% OA** while cutting model parameters by **41.4%** (`342,160` vs `584,144`).
+
+---
+
+### 4.2 Accuracy vs. Band Budget Curve
+
+<!-- ================= PASTE SCREENSHOT 2: CELL 8 OA-VS-K LINE CHART HERE ================= -->
+![Accuracy vs Band Budget Curve](assets/accuracy_vs_k.png)
+
+* **`learned` Peaks at `k = 5` and Declines at Larger Budgets (`k = 20, 40`):** `ConcreteSelector` optimizes a 1-pixel MLP proxy on an internal random pixel split (`93.1%–94.5%` held-out accuracy). At $k \in \{20, 40\}$, high selector capacity overfits intra-superpixel spectral quirks (`85.65%` at `k = 20`, `83.69%` at `k = 40`), compounded by `MIN_GAP = 3` blocking up to `120` of `204` bands during greedy discretization.
+* **`PCA` Scales Monotonically (`87.56%` $\rightarrow$ `91.59%`):** Orthogonal compression removes collinear spectral noise that causes the uncompressed `204`-band model (`86.27%`) to overfit training superpixels, reaching **`91.33%`** at `k = 30` and **`91.59%`** at `k = 40`.
+* **`ANOVA` Stalls Across All Budgets (`81.29%–82.49%`):** Univariate F-score ranking fails to improve even as $k$ increases from `5` to `40`, trailing `random` subsets (`85.83%` at `k = 5`) by more than **4.4%**.
+
+---
+
+### 4.3 Spectral Placement: Learned Bands vs. ANOVA-F
+
+<!-- ================= PASTE SCREENSHOTS 3–6: CELL 9 SPECTRAL PLOTS HERE ================= -->
+| $k = 5$ (`0/5` shared) | $k = 10$ (`1/10` shared) |
+| :---: | :---: |
+| ![Selected Bands k=5](assets/bands_k5.png) | ![Selected Bands k=10](assets/bands_k10.png) |
+
+| $k = 20$ (`4/20` shared) | $k = 40$ (`8/40` shared) |
+| :---: | :---: |
+| ![Selected Bands k=20](assets/bands_k20.png) | ![Selected Bands k=40](assets/bands_k40.png) |
+
+*(Note: If you captured all four spectral plots in one combined screenshot, replace the table above with a single `![Selected Bands Across Spectrum](assets/bands_all.png)` image.)*
+
+* **ANOVA Collapses onto Adjacent Redundant Bands:** Because neighboring hyperspectral channels share nearly identical F-scores, `anova` picks tightly packed clusters—`[41, 42, 43, 44, 45]` at `k = 5` and `[14..16, 40..46]` at `k = 10`—starving the spatial-spectral classifier of cross-spectrum contrast.
+* **ConcreteSelector Discovers Complementary Wavelengths:** Guided by uniqueness regularization and `MIN_GAP = 3`, `learned` spreads selections across distinct absorption and reflectance regions (`[8, 18, 83, 102, 150]` for seed `42`; `[17, 82, 95, 104, 199]` for seed `43`), sharing **0 of 5 bands** with `anova` at `k = 5`.
+
+---
+
+## 5. Repository Structure
+
+```text
+├── assets/
+│   ├── results_table.png                          # Cell 8 summary metrics screenshot
+│   ├── accuracy_vs_k.png                          # Cell 8 OA vs. band budget curve
+│   └── bands_k5.png ... bands_k40.png             # Cell 9 spectral band overlay plots
+├── Experiment3_BandSelection_v3_Colabfull.ipynb   # Main 60-run leak-free benchmark notebook (MODE="full")
+├── Experiment3_BandSelection_v3_Colab (1).ipynb   # Quick 6-run noise verification notebook (MODE="check")
+├── exp3_v3_results_full_group.csv                 # Per-run OA, AA, Kappa, train_acc, runtime, and params (60 rows)
+├── exp3_v3_selected_full_group.json               # Exact selected band indices for every (method, k, seed, draw)
+├── exp3_v3_results_check_group.csv                # Noise check results at k=10 across seeds [42, 43, 44]
+└── README.md
+```
+
+---
+
+## 6. Conclusion & Future Directions
+
+Enforcing spatially disjoint superpixel splits with an exact `13 × 13` patch buffer transforms hyperspectral band selection evaluation from saturated memorization (`~99.95%` OA) into a reliable test of spatial generalization (`81.3%–91.6%` OA). Under this protocol:
+
+* **At tight sensor budgets (`k = 5`), learned Gumbel-Softmax band selection (`88.91%` OA) is the strongest raw-band method**, beating `uniform` (`86.46%`), `random` (`85.83%`), `anova` (`81.42%`), and the `204`-band full-spectrum baseline (`86.27%`).
+* **Univariate F-test ranking (`ANOVA`) consistently underperforms** because adjacent hyperspectral bands carry redundant F-scores, confirming that spectral diversity is essential for spatial-spectral models.
+* **When all bands are available at capture time, `PCA (k = 30–40)` achieves the highest overall accuracy (`91.33%–91.59%` OA)** by compressing collinear noise before ViT + Graph fusion.
+
+**Recommended Next Steps:**
+1. **Group-Aware Selector Proxy:** Replace the internal random pixel split inside `learn_bands()` with a superpixel-grouped split (`ref_seg[r_tr, c_tr]`) so `ConcreteSelector` directly optimizes for cross-superpixel generalization at $k \ge 20$.
+2. **Multi-Split Robustness:** Repeat the `MODE = "full"` grid across additional superpixel split seeds (`SPLIT_SEED = 43, 44`) to tighten confidence intervals beyond 2 model seeds.
+3. **Cross-Dataset Validation:** Apply the identical buffer-isolated superpixel protocol to **Indian Pines** and **Pavia University** to verify spectral selection transferability.
